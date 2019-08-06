@@ -34,6 +34,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Semaphore;
 import java.util.stream.Collectors;
 
+import static cd.go.contrib.elasticagents.docker.DockerContainer.SIDECAR_CONTAINER_NAME;
 import static cd.go.contrib.elasticagents.docker.DockerPlugin.LOG;
 import static cd.go.contrib.elasticagents.docker.utils.Util.readableSize;
 
@@ -87,7 +88,11 @@ public class DockerContainers implements AgentInstances<DockerContainer> {
     public void terminate(String agentId, PluginSettings settings) throws Exception {
         DockerContainer instance = instances.get(agentId);
         if (instance != null) {
-            instance.terminate(docker(settings));
+            DockerClient docker = docker(settings);
+            instance.terminate(docker);
+            String name = SIDECAR_CONTAINER_NAME + "-for-container-" + agentId;
+            docker.stopContainer(name, 2);
+            docker.removeContainer(name);
         } else {
             LOG.warn("Requested to terminate an instance that does not exist " + agentId);
         }
@@ -151,7 +156,7 @@ public class DockerContainers implements AgentInstances<DockerContainer> {
 
         Info info = dockerClient.info();
         return new StatusReport(info.osType(), info.architecture(), info.serverVersion(),
-            info.cpus(), readableSize(info.memTotal()), getContainerStatus(dockerClient));
+                info.cpus(), readableSize(info.memTotal()), getContainerStatus(dockerClient));
     }
 
     public AgentStatusReport getAgentStatusReport(PluginSettings pluginSettings, DockerContainer dockerContainer) throws Exception {
@@ -210,9 +215,9 @@ public class DockerContainers implements AgentInstances<DockerContainer> {
 
     public Optional<DockerContainer> find(JobIdentifier jobIdentifier) {
         return instances.values()
-            .stream()
-            .filter(instance -> instance.getJobIdentifier().equals(jobIdentifier))
-            .findFirst();
+                .stream()
+                .filter(instance -> instance.getJobIdentifier().equals(jobIdentifier))
+                .findFirst();
     }
 
     // used by test

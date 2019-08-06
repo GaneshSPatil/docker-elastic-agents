@@ -28,10 +28,7 @@ import com.spotify.docker.client.DockerClient;
 import com.spotify.docker.client.exceptions.ContainerNotFoundException;
 import com.spotify.docker.client.exceptions.DockerException;
 import com.spotify.docker.client.exceptions.ImageNotFoundException;
-import com.spotify.docker.client.messages.ContainerConfig;
-import com.spotify.docker.client.messages.ContainerCreation;
-import com.spotify.docker.client.messages.ContainerInfo;
-import com.spotify.docker.client.messages.HostConfig;
+import com.spotify.docker.client.messages.*;
 import org.apache.commons.lang.StringUtils;
 import org.joda.time.DateTime;
 
@@ -50,6 +47,22 @@ public class DockerContainer {
     private final String id;
     private String name;
     private final JobIdentifier jobIdentifier;
+
+    private final static String GOCD_JRE_VOLUME = "gocd-jre-volume-created-by-gocd-docker-ea-plugin";
+    private final static String GO_AGENT_VOLUME = "go-agent-volume-created-by-gocd-docker-ea-plugin";
+    private final static String GO_VOLUME = "go-volume-created-by-gocd-docker-ea-plugin";
+    private final static String SBIN_VOLUME = "sbin-volume-created-by-gocd-docker-ea-plugin";
+    private final static String GOCD_SIDECAR_VOLUME = "gocd-sidecar-volume-created-by-gocd-docker-ea-plugin";
+    public final static String SIDECAR_CONTAINER_NAME = "gocd-sidecar-container-created-by-gocd-docker-ea-plugin";
+    private final static ArrayList<String> volumes = new ArrayList<>();
+
+    static {
+        volumes.add(GOCD_JRE_VOLUME);
+        volumes.add(GO_AGENT_VOLUME);
+        volumes.add(GO_VOLUME);
+        volumes.add(SBIN_VOLUME);
+        volumes.add(GOCD_SIDECAR_VOLUME);
+    }
 
     public DockerContainer(String id, String name, JobIdentifier jobIdentifier, Date createdAt, Map<String, String> properties, String environment) {
         this.id = id;
@@ -97,7 +110,10 @@ public class DockerContainer {
 
     public static DockerContainer create(CreateAgentRequest request, PluginSettings settings, DockerClient docker,
                                          ConsoleLogAppender consoleLogAppender) throws InterruptedException, DockerException {
+        LOG.info("inside docker container create method...");
+
         String containerName = UUID.randomUUID().toString();
+        initializeSidecar(docker, containerName);
 
         HashMap<String, String> labels = labelsFrom(request);
         String imageName = image(request.properties());
@@ -143,10 +159,13 @@ public class DockerContainer {
             hostBuilder.appendBinds(Util.splitIntoLinesAndTrimSpaces(volumeMounts));
         }
 
+        hostBuilder.volumesFrom(SIDECAR_CONTAINER_NAME + "-for-container-" + containerName);
         ContainerConfig containerConfig = containerConfigBuilder
                 .image(imageName)
                 .labels(labels)
                 .env(env)
+                .entrypoint("/bin/sh", "-c")
+                .cmd("/gocd-sidecar/start-agent.sh")
                 .hostConfig(hostBuilder.build())
                 .build();
 
@@ -156,11 +175,11 @@ public class DockerContainer {
 
         ContainerInfo containerInfo = docker.inspectContainer(id);
 
-        LOG.debug("Created container " + containerName);
+        LOG.info("Created container " + containerName);
         consoleLogAppender.accept(String.format("Starting container: %s", containerName));
         docker.startContainer(containerName);
         consoleLogAppender.accept(String.format("Started container: %s", containerName));
-        LOG.debug("container " + containerName + " started");
+        LOG.info("container " + containerName + " started");
         return new DockerContainer(id, containerName, request.jobIdentifier(), containerInfo.created(), request.properties(), request.environment());
     }
 
@@ -174,7 +193,8 @@ public class DockerContainer {
 
         env.addAll(Arrays.asList(
                 "GO_EA_MODE=" + mode(),
-                "GO_EA_SERVER_URL=" + settings.getGoServerUrl()
+                "GO_EA_SERVER_URL=" + settings.getGoServerUrl(),
+                "GO_JAVA_HOME=/gocd-jre"
         ));
 
         env.addAll(request.autoregisterPropertiesAsEnvironmentVars(containerName));
@@ -273,7 +293,7 @@ public class DockerContainer {
     private static List<String> extraHosts(ContainerInfo containerInfo) {
         HostConfig hostConfig = containerInfo.hostConfig();
         if (hostConfig != null) {
-           return hostConfig.extraHosts();
+            return hostConfig.extraHosts();
         }
         return new ArrayList<>();
     }
@@ -293,5 +313,53 @@ public class DockerContainer {
             LOG.debug("Could not fetch logs", e);
             return "";
         }
+    }
+
+    private static void createVolume(DockerClient dockerClient, String volumeName) throws DockerException, InterruptedException {
+        LOG.info("Creating volume:" + volumeName);
+        final Volume toCreate = Volume.builder().name(volumeName).build();
+        dockerClient.createVolume(toCreate);
+        LOG.info("Done creating volume:" + volumeName);
+    }
+
+    private static void pullSideCarImage(DockerClient dockerClient) throws DockerException, InterruptedException {
+        LOG.info("Pulling sidecar container image..");
+
+        String sidecarImage = "ganeshpl/sidecar-container:v1";
+        dockerClient.pull(sidecarImage);
+
+        LOG.info("Done pulling sidecar container image..");
+    }
+
+    private static void startSideCarContainer(DockerClient dockerClient, String sideCarContainerForContainer) throws DockerException, InterruptedException {
+        String sidecarImage = "ganeshpl/sidecar-container:v1";
+
+        final HostConfig hostConfig = HostConfig.builder()
+                .appendBinds(HostConfig.Bind.from(dockerClient.inspectVolume(GOCD_JRE_VOLUME + "-for-container-" + sideCarContainerForContainer)).to("/gocd-jre").readOnly(false).build())
+                .appendBinds(HostConfig.Bind.from(dockerClient.inspectVolume(GO_AGENT_VOLUME + "-for-container-" + sideCarContainerForContainer)).to("/go-agent").readOnly(false).build())
+                .appendBinds(HostConfig.Bind.from(dockerClient.inspectVolume(GO_VOLUME + "-for-container-" + sideCarContainerForContainer)).to("/go").readOnly(false).build())
+                .appendBinds(HostConfig.Bind.from(dockerClient.inspectVolume(SBIN_VOLUME + "-for-container-" + sideCarContainerForContainer)).to("/usr/local/sbin").readOnly(false).build())
+                .appendBinds(HostConfig.Bind.from(dockerClient.inspectVolume(GOCD_SIDECAR_VOLUME + "-for-container-" + sideCarContainerForContainer)).to("/gocd-sidecar").readOnly(false).build())
+                .build();
+
+        final ContainerConfig config = ContainerConfig.builder()
+                .image(sidecarImage)
+                .hostConfig(hostConfig)
+                .build();
+
+        ContainerCreation container = dockerClient.createContainer(config, SIDECAR_CONTAINER_NAME + "-for-container-" + sideCarContainerForContainer);
+        LOG.info("Created sidecar container...");
+        dockerClient.startContainer(container.id());
+        LOG.info("Started sidecar container...");
+    }
+
+    public static void initializeSidecar(DockerClient dockerClient, String sideCarContainerForContainer) throws DockerException, InterruptedException {
+        LOG.info(String.format("Received a request to initialize sidecar container for %s", sideCarContainerForContainer));
+        for (String volume : volumes) {
+            createVolume(dockerClient, String.format("%s-for-container-%s", volume, sideCarContainerForContainer));
+        }
+        pullSideCarImage(dockerClient);
+        startSideCarContainer(dockerClient, sideCarContainerForContainer);
+        LOG.info(String.format("Done processing request to initialize sidecar container for %s", sideCarContainerForContainer));
     }
 }

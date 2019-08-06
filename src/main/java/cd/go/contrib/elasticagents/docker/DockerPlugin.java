@@ -49,6 +49,7 @@ public class DockerPlugin implements GoPlugin {
 
     @Override
     public GoPluginApiResponse handle(GoPluginApiRequest request) {
+        LOG.info("received a request from server: " + request.requestName());
         ClusterProfileProperties clusterProfileProperties;
         try {
             switch (Request.fromString(request.requestName())) {
